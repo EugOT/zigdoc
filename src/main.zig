@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const Walk = @import("Walk.zig");
 const log = std.log.scoped(.zigdoc);
 
@@ -12,70 +11,62 @@ const template_build_zig_zon = @embedFile("templates/build.zig.zon.template");
 const template_agents_md = @embedFile("templates/AGENTS.md.template");
 const template_gitignore = @embedFile("templates/.gitignore.template");
 
-pub fn main() !void {
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    const gpa, const is_debug = gpa: {
-        break :gpa switch (builtin.mode) {
-            .Debug, .ReleaseSafe => .{ debug_allocator.allocator(), true },
-            .ReleaseFast, .ReleaseSmall => .{ std.heap.smp_allocator, false },
-        };
-    };
-    defer if (is_debug) {
-        _ = debug_allocator.deinit();
-    };
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    var args = try std.process.argsWithAllocator(arena.allocator());
-    defer args.deinit();
-    _ = args.skip(); // skip program name
+    var args_iter = try init.minimal.args.iterateAllocator(arena.allocator());
+    defer args_iter.deinit();
+    _ = args_iter.skip(); // skip program name
 
-    const symbol = args.next();
+    const symbol = args_iter.next();
 
     if (symbol == null) {
-        try printUsage();
+        try printUsage(io);
         return;
     }
 
     if (std.mem.eql(u8, symbol.?, "--help") or std.mem.eql(u8, symbol.?, "-h")) {
-        try printUsage();
+        try printUsage(io);
         return;
     }
 
     if (std.mem.eql(u8, symbol.?, "--dump-imports")) {
-        try dumpImports(&arena);
+        try dumpImports(io, &arena);
         return;
     }
 
     if (std.mem.eql(u8, symbol.?, "@init")) {
-        try initProject(arena.allocator());
+        try initProject(arena.allocator(), io);
         return;
     }
 
-    Walk.init(arena.allocator());
+    Walk.init(arena.allocator(), io);
     Walk.Decl.init(arena.allocator());
 
-    const std_dir_path = try getStdDir(&arena);
+    const std_dir_path = try getStdDir(io, &arena);
 
     // Only parse std library if the symbol starts with "std"
     if (std.mem.startsWith(u8, symbol.?, "std")) {
-        try walkStdLib(&arena, std_dir_path);
+        try walkStdLib(io, &arena, std_dir_path);
 
         // Register std/std.zig as the "std" module for @import("std")
         const std_file_index = Walk.files.getIndex("std/std.zig") orelse return error.StdNotFound;
         try Walk.modules.put(arena.allocator(), "std", @enumFromInt(std_file_index));
     } else {
         // For non-std symbols, process build.zig to get imported modules
-        try processBuildZig(&arena);
+        try processBuildZig(io, &arena);
     }
 
-    try printDocs(arena.allocator(), symbol.?, std_dir_path);
+    try printDocs(arena.allocator(), io, symbol.?, std_dir_path);
 }
 
-fn printUsage() !void {
+fn printUsage(io: std.Io) !void {
     var stdout_buf: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
     try stdout_writer.interface.writeAll(
         \\Usage: zigdoc [options] <symbol>
         \\
@@ -100,55 +91,57 @@ fn printUsage() !void {
         \\
     );
     try stdout_writer.interface.flush();
+    try stdout_writer.end();
 }
 
-fn initProject(allocator: std.mem.Allocator) !void {
-    const cwd = std.fs.cwd();
+fn initProject(allocator: std.mem.Allocator, io: std.Io) !void {
+    const cwd = std.Io.Dir.cwd();
 
     // Check if project already exists
-    if (cwd.access("build.zig", .{})) |_| {
+    if (cwd.access(io, "build.zig", .{})) |_| {
         std.debug.print("Error: build.zig already exists\n", .{});
         return error.ProjectExists;
     } else |_| {}
 
     // Get project name from current directory
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd_path = try cwd.realpath(".", &path_buf);
+    const cwd_path_len = try cwd.realPath(io, &path_buf);
+    const cwd_path = path_buf[0..cwd_path_len];
     const name = std.fs.path.basename(cwd_path);
 
     // Create src directory
-    try cwd.makeDir("src");
+    try cwd.createDir(io, "src", .default_dir);
 
     // Write files with substitutions
-    try cwd.writeFile(.{
+    try cwd.writeFile(io, .{
         .sub_path = "build.zig",
         .data = try substitute(allocator, template_build_zig, name),
     });
-    try cwd.writeFile(.{
+    try cwd.writeFile(io, .{
         .sub_path = "build.zig.zon",
         .data = try substitute(allocator, template_build_zig_zon, name),
     });
-    try cwd.writeFile(.{ .sub_path = "src/main.zig", .data = template_main_zig });
-    try cwd.writeFile(.{ .sub_path = "AGENTS.md", .data = template_agents_md });
-    try cwd.writeFile(.{ .sub_path = ".gitignore", .data = template_gitignore });
+    try cwd.writeFile(io, .{ .sub_path = "src/main.zig", .data = template_main_zig });
+    try cwd.writeFile(io, .{ .sub_path = "AGENTS.md", .data = template_agents_md });
+    try cwd.writeFile(io, .{ .sub_path = ".gitignore", .data = template_gitignore });
 
     // Run zig build to get suggested fingerprint from error message
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    const result = std.process.run(allocator, io, .{
         .argv = &.{ "zig", "build" },
+        .stdout_limit = .limited(1024 * 1024),
     }) catch {
         std.debug.print("Initialized Zig project '{s}' (run 'zig build' to generate fingerprint)\n", .{name});
         return;
     };
 
     // Parse fingerprint from error: "suggested value: 0x..."
-    if (std.mem.indexOf(u8, result.stderr, "suggested value: ")) |start| {
+    if (std.mem.find(u8, result.stderr, "suggested value: ")) |start| {
         const fp_start = start + "suggested value: ".len;
         const fp_end = std.mem.indexOfPos(u8, result.stderr, fp_start, "\n") orelse result.stderr.len;
         const fingerprint = result.stderr[fp_start..fp_end];
 
         // Read current build.zig.zon and insert fingerprint
-        const zon_content = try cwd.readFileAlloc(allocator, "build.zig.zon", 64 * 1024);
+        const zon_content = try cwd.readFileAlloc(io, "build.zig.zon", allocator, .limited(64 * 1024));
         const new_zon = try std.mem.replaceOwned(
             u8,
             allocator,
@@ -156,7 +149,7 @@ fn initProject(allocator: std.mem.Allocator) !void {
             ".version = \"0.0.0\",",
             try std.fmt.allocPrint(allocator, ".version = \"0.0.0\",\n    .fingerprint = {s},", .{fingerprint}),
         );
-        try cwd.writeFile(.{ .sub_path = "build.zig.zon", .data = new_zon });
+        try cwd.writeFile(io, .{ .sub_path = "build.zig.zon", .data = new_zon });
     }
 
     std.debug.print("Initialized Zig project '{s}'\n", .{name});
@@ -167,114 +160,135 @@ fn substitute(allocator: std.mem.Allocator, template: []const u8, name: []const 
     return std.mem.replaceOwned(u8, allocator, template, "{{name}}", sanitized);
 }
 
-fn dumpImports(arena: *std.heap.ArenaAllocator) !void {
+fn dumpImports(io: std.Io, arena: *std.heap.ArenaAllocator) !void {
+    const cwd = std.Io.Dir.cwd();
+
     // Check if build.zig exists
-    std.fs.cwd().access("build.zig", .{}) catch {
+    cwd.access(io, "build.zig", .{}) catch {
         std.debug.print("No build.zig found in current directory\n", .{});
         return error.NoBuildZig;
     };
 
     // Setup the build runner
-    try setupBuildRunner(arena);
+    try setupBuildRunner(io, arena);
 
     // Run zig build with our custom runner
-    const result = try std.process.Child.run(.{
-        .allocator = arena.allocator(),
+    const result = try std.process.run(arena.allocator(), io, .{
         .argv = &[_][]const u8{
             "zig",
             "build",
             "--build-runner",
             ".zig-cache/zigdoc_build_runner.zig",
         },
+        .stdout_limit = .limited(64 * 1024 * 1024),
     });
 
-    if (result.term.Exited != 0) {
-        std.debug.print("Error running build runner:\n{s}\n", .{result.stderr});
-        return error.BuildRunnerFailed;
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            std.debug.print("Error running build runner:\n{s}\n", .{result.stderr});
+            return error.BuildRunnerFailed;
+        },
+        else => {
+            std.debug.print("Build runner terminated abnormally:\n{s}\n", .{result.stderr});
+            return error.BuildRunnerFailed;
+        },
     }
 
     // Print the JSON output directly
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
     try stdout_writer.interface.writeAll(result.stdout);
     try stdout_writer.interface.flush();
+    try stdout_writer.end();
 }
 
 const ZigEnv = struct {
     std_dir: []const u8,
 };
 
-fn getZigVersion(arena: *std.heap.ArenaAllocator) !std.SemanticVersion {
-    const version_result = try std.process.Child.run(.{
-        .allocator = arena.allocator(),
+fn getZigVersion(io: std.Io, arena: *std.heap.ArenaAllocator) !std.SemanticVersion {
+    const version_result = try std.process.run(arena.allocator(), io, .{
         .argv = &[_][]const u8{ "zig", "version" },
+        .stdout_limit = .limited(4 * 1024),
     });
 
-    if (version_result.term.Exited != 0) {
-        return error.ZigVersionFailed;
+    switch (version_result.term) {
+        .exited => |code| if (code != 0) return error.ZigVersionFailed,
+        else => return error.ZigVersionFailed,
     }
 
     const version_str = std.mem.trim(u8, version_result.stdout, &std.ascii.whitespace);
     return std.SemanticVersion.parse(version_str);
 }
 
-fn setupBuildRunner(arena: *std.heap.ArenaAllocator) !void {
-    const version = try getZigVersion(arena);
+fn setupBuildRunner(io: std.Io, arena: *std.heap.ArenaAllocator) !void {
+    const version = try getZigVersion(io, arena);
 
     const runner_src = switch (version.minor) {
         14 => build_runner_0_14,
-        15 => build_runner_0_15,
+        15, 16 => build_runner_0_15,
         else => return error.UnsupportedZigVersion,
     };
 
-    std.fs.cwd().makeDir(".zig-cache") catch |err| switch (err) {
+    const cwd = std.Io.Dir.cwd();
+    cwd.createDir(io, ".zig-cache", .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
 
     const runner_path = ".zig-cache/zigdoc_build_runner.zig";
-    try std.fs.cwd().writeFile(.{
+    try cwd.writeFile(io, .{
         .sub_path = runner_path,
         .data = runner_src,
     });
 }
 
-fn processBuildZig(arena: *std.heap.ArenaAllocator) !void {
+fn processBuildZig(io: std.Io, arena: *std.heap.ArenaAllocator) !void {
+    const cwd = std.Io.Dir.cwd();
+
     // Check if build.zig exists
-    std.fs.cwd().access("build.zig", .{}) catch {
+    cwd.access(io, "build.zig", .{}) catch {
         // No build.zig, nothing to do
         return;
     };
 
     // Setup the build runner
-    try setupBuildRunner(arena);
+    try setupBuildRunner(io, arena);
 
     // Run zig build with our custom runner
-    const result = try std.process.Child.run(.{
-        .allocator = arena.allocator(),
+    const result = try std.process.run(arena.allocator(), io, .{
         .argv = &[_][]const u8{
             "zig",
             "build",
             "--build-runner",
             ".zig-cache/zigdoc_build_runner.zig",
         },
+        .stdout_limit = .limited(64 * 1024 * 1024),
     });
 
-    if (result.term.Exited != 0) {
-        log.err("Failed to analyze build.zig", .{});
-        return;
+    switch (result.term) {
+        .exited => |code| if (code != 0) {
+            log.err("Failed to analyze build.zig", .{});
+            return;
+        },
+        else => {
+            log.err("Failed to analyze build.zig", .{});
+            return;
+        },
     }
 
     // Parse the output to extract module information
-    try parseBuildOutput(arena.allocator(), result.stdout);
+    try parseBuildOutput(arena.allocator(), io, result.stdout);
 }
 
-fn parseBuildOutput(allocator: std.mem.Allocator, output: []const u8) !void {
+fn parseBuildOutput(allocator: std.mem.Allocator, io: std.Io, output: []const u8) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, output, .{});
     defer parsed.deinit();
 
     const root_obj = parsed.value.object;
     const modules_obj = root_obj.get("modules") orelse return;
+
+    const cwd = std.Io.Dir.cwd();
 
     var modules_iter = modules_obj.object.iterator();
     while (modules_iter.next()) |entry| {
@@ -287,10 +301,11 @@ fn parseBuildOutput(allocator: std.mem.Allocator, output: []const u8) !void {
         if (!std.mem.endsWith(u8, root_path, ".zig")) continue;
 
         // Read and add the module file
-        const file_content = std.fs.cwd().readFileAlloc(
-            allocator,
+        const file_content = cwd.readFileAlloc(
+            io,
             root_path,
-            10 * 1024 * 1024,
+            allocator,
+            .limited(10 * 1024 * 1024),
         ) catch |err| {
             std.debug.print("Failed to read module {s}: {}\n", .{ module_name, err });
             continue;
@@ -310,10 +325,11 @@ fn parseBuildOutput(allocator: std.mem.Allocator, output: []const u8) !void {
                 if (!std.mem.endsWith(u8, import_path, ".zig")) continue;
 
                 // Read and add the imported file
-                const import_content = std.fs.cwd().readFileAlloc(
-                    allocator,
+                const import_content = cwd.readFileAlloc(
+                    io,
                     import_path,
-                    10 * 1024 * 1024,
+                    allocator,
+                    .limited(10 * 1024 * 1024),
                 ) catch |err| {
                     std.debug.print("Failed to read import {s}: {}\n", .{ import_name, err });
                     continue;
@@ -326,18 +342,19 @@ fn parseBuildOutput(allocator: std.mem.Allocator, output: []const u8) !void {
     }
 }
 
-fn getStdDir(arena: *std.heap.ArenaAllocator) ![]const u8 {
-    const version = try getZigVersion(arena);
+fn getStdDir(io: std.Io, arena: *std.heap.ArenaAllocator) ![]const u8 {
+    const version = try getZigVersion(io, arena);
 
     const is_pre_0_15 = version.order(.{ .major = 0, .minor = 15, .patch = 0 }) == .lt;
 
-    const result = try std.process.Child.run(.{
-        .allocator = arena.allocator(),
+    const result = try std.process.run(arena.allocator(), io, .{
         .argv = &[_][]const u8{ "zig", "env" },
+        .stdout_limit = .limited(64 * 1024),
     });
 
-    if (result.term.Exited != 0) {
-        return error.ZigEnvFailed;
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.ZigEnvFailed,
+        else => return error.ZigEnvFailed,
     }
 
     const stdout = try arena.allocator().dupeZ(u8, result.stdout);
@@ -351,7 +368,7 @@ fn getStdDir(arena: *std.heap.ArenaAllocator) ![]const u8 {
         );
         return parsed.value.std_dir;
     } else {
-        const parsed = try std.zon.parse.fromSlice(
+        const parsed = try std.zon.parse.fromSliceAlloc(
             ZigEnv,
             arena.allocator(),
             stdout,
@@ -362,31 +379,31 @@ fn getStdDir(arena: *std.heap.ArenaAllocator) ![]const u8 {
     }
 }
 
-fn walkStdLib(arena: *std.heap.ArenaAllocator, std_dir_path: []const u8) !void {
+fn walkStdLib(io: std.Io, arena: *std.heap.ArenaAllocator, std_dir_path: []const u8) !void {
     const allocator = arena.allocator();
-    var dir = try std.fs.openDirAbsolute(std_dir_path, .{ .iterate = true });
-    defer dir.close();
+    var dir = try std.Io.Dir.openDirAbsolute(io, std_dir_path, .{ .iterate = true });
+    defer dir.close(io);
 
     var walker = try dir.walk(allocator);
     defer walker.deinit();
 
-    while (try walker.next()) |entry| {
+    while (try walker.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
         if (std.mem.endsWith(u8, entry.basename, "test.zig")) continue;
 
         const file_content = try entry.dir.readFileAllocOptions(
-            allocator,
+            io,
             entry.basename,
-            10 * 1024 * 1024,
-            null,
-            @enumFromInt(0),
+            allocator,
+            .limited(10 * 1024 * 1024),
+            .@"1",
             0,
         );
 
         const file_name = try std.fmt.allocPrint(allocator, "std/{s}", .{entry.path});
 
-        _ = try Walk.addFile(file_name, file_content);
+        _ = try Walk.addFile(file_name, @constCast(file_content));
     }
 }
 
@@ -539,16 +556,17 @@ fn printDeclInfo(
     }
 }
 
-fn printDocs(allocator: std.mem.Allocator, symbol: []const u8, std_dir_path: []const u8) !void {
+fn printDocs(allocator: std.mem.Allocator, io: std.Io, symbol: []const u8, std_dir_path: []const u8) !void {
     var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
     const stdout = &stdout_writer.interface;
 
     // Try hierarchical resolution first (e.g., "zeit.timezone.Posix")
-    if (std.mem.indexOf(u8, symbol, ".")) |_| {
+    if (std.mem.find(u8, symbol, ".")) |_| {
         if (try resolveHierarchical(allocator, symbol)) |decl| {
             try printDeclInfo(allocator, stdout, decl, symbol, std_dir_path);
             try stdout.flush();
+            try stdout_writer.end();
             return;
         }
     }
@@ -585,6 +603,7 @@ fn printDocs(allocator: std.mem.Allocator, symbol: []const u8, std_dir_path: []c
         const first_part = parts.next() orelse {
             try stdout.writeAll("Tip: Specify a symbol like 'std.ArrayList' or 'moduleName.Symbol'\n");
             try stdout.flush();
+            try stdout_writer.end();
             std.process.exit(1);
         };
 
@@ -617,10 +636,12 @@ fn printDocs(allocator: std.mem.Allocator, symbol: []const u8, std_dir_path: []c
         }
 
         try stdout.flush();
+        try stdout_writer.end();
         std.process.exit(1);
     }
 
     try stdout.flush();
+    try stdout_writer.end();
 }
 
 fn printMembers(allocator: std.mem.Allocator, writer: anytype, decl: *const Walk.Decl, category: Walk.Category) !bool {
