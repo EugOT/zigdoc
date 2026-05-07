@@ -6,18 +6,20 @@ const Ast = std.zig.Ast;
 const assert = std.debug.assert;
 const log = std.log;
 var gpa: std.mem.Allocator = undefined;
+var io_global: std.Io = undefined;
 
-pub fn init(allocator: std.mem.Allocator) void {
+pub fn init(allocator: std.mem.Allocator, io: std.Io) void {
     gpa = allocator;
+    io_global = io;
 }
 
 const Oom = error{OutOfMemory};
 
 pub const Decl = @import("Decl.zig");
 
-pub var files: std.StringArrayHashMapUnmanaged(File) = .empty;
+pub var files: std.array_hash_map.String(File) = .empty;
 pub var decls: std.ArrayList(Decl) = .empty;
-pub var modules: std.StringArrayHashMapUnmanaged(File.Index) = .empty;
+pub var modules: std.array_hash_map.String(File.Index) = .empty;
 
 file: File.Index,
 
@@ -338,7 +340,7 @@ pub const File = struct {
                 }
 
                 const resolved_path = if (std.fs.path.isAbsolute(file_path))
-                    std.fs.realpathAlloc(gpa, file_path) catch file_path
+                    std.Io.Dir.cwd().realPathFileAlloc(io_global, file_path, gpa) catch file_path
                 else blk: {
                     const base_path = file_index.path();
                     break :blk std.fs.path.resolve(gpa, &.{
@@ -360,10 +362,11 @@ pub const File = struct {
                         node,
                     );
                 } else {
-                    const import_content = std.fs.cwd().readFileAlloc(
-                        gpa,
+                    const import_content = std.Io.Dir.cwd().readFileAlloc(
+                        io_global,
                         resolved_path,
-                        10 * 1024 * 1024,
+                        gpa,
+                        .limited(10 * 1024 * 1024),
                     ) catch |err| {
                         log.warn("import target '{s}' could not be read: {}", .{ resolved_path, err });
                         return .{ .global_const = node };
@@ -431,7 +434,7 @@ pub fn addFile(file_name: []const u8, bytes: []u8) !File.Index {
     const ast = try parse(file_name, bytes);
     assert(ast.errors.len == 0);
 
-    const normalized_path = std.fs.realpathAlloc(gpa, file_name) catch file_name;
+    const normalized_path = std.Io.Dir.cwd().realPathFileAlloc(io_global, file_name, gpa) catch file_name;
 
     // Check if this file already exists to avoid duplicate entries
     if (files.getIndex(normalized_path)) |existing_index| {
@@ -515,8 +518,8 @@ pub const Scope = struct {
     const Namespace = struct {
         base: Scope = .{ .tag = .namespace },
         parent: *Scope,
-        names: std.StringArrayHashMapUnmanaged(Ast.Node.Index) = .empty,
-        doctests: std.StringArrayHashMapUnmanaged(Ast.Node.Index) = .empty,
+        names: std.array_hash_map.String(Ast.Node.Index) = .empty,
+        doctests: std.array_hash_map.String(Ast.Node.Index) = .empty,
         decl_index: Decl.Index,
     };
 
@@ -843,8 +846,6 @@ fn expr(w: *Walk, scope: *Scope, parent_decl: Decl.Index, node: Ast.Node.Index) 
             }
             try expr(w, scope, parent_decl, full.ast.template);
         },
-
-        .asm_legacy => {},
 
         .builtin_call_two,
         .builtin_call_two_comma,

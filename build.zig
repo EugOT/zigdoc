@@ -19,7 +19,7 @@ pub fn build(b: *std.Build) void {
     // Generate README.md as part of the default build
     const readme_run = b.addRunArtifact(exe);
     readme_run.addArg("--help");
-    const help_output = readme_run.captureStdOut();
+    const help_output = readme_run.captureStdOut(.{});
 
     const gen_readme = b.addExecutable(.{
         .name = "gen_readme",
@@ -56,8 +56,19 @@ pub fn build(b: *std.Build) void {
 
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    // Pin the build_readme argument-parser invariants (see PR #1 review).
+    const build_readme_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build_readme.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_build_readme_tests = b.addRunArtifact(build_readme_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_build_readme_tests.step);
 
     const fmt_step = b.step("fmt", "Check code formatting");
     const fmt_check = b.addFmt(.{

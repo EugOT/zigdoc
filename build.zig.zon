@@ -2,11 +2,11 @@
     .name = .zigdoc,
     .version = "0.0.0",
     .fingerprint = 0x50a871f441c1a7ed,
-    .minimum_zig_version = "0.15.1",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .ziglint = .{
-            .url = "https://github.com/rockorager/ziglint/archive/refs/tags/v0.5.2.tar.gz",
-            .hash = "ziglint-0.5.2-t0bwL2FwBQC5i-ifhKKv2ls5jGXHShJpuNhFVhiU-Tt-",
+            .url = "git+https://github.com/EugOT/ziglint.git?ref=fix/0.16-build-compat#40f26f1283468032ec993c93fca921bd3c106adb",
+            .hash = "ziglint-0.5.2-t0bwLz2XBQCgnA0PTY0KM9YgrmdjLU7wwjXablNijOuq",
         },
     },
     .paths = .{
