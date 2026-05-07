@@ -7,7 +7,7 @@ fn setupTest(allocator: std.mem.Allocator) !void {
     Walk.files = .empty;
     Walk.decls = .empty;
     Walk.modules = .empty;
-    Walk.init(allocator);
+    Walk.init(allocator, std.testing.io);
     Decl.init(allocator);
 }
 
