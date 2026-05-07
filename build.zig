@@ -19,7 +19,7 @@ pub fn build(b: *std.Build) void {
     // Generate README.md as part of the default build
     const readme_run = b.addRunArtifact(exe);
     readme_run.addArg("--help");
-    const help_output = readme_run.captureStdOut();
+    const help_output = readme_run.captureStdOut(.{});
 
     const gen_readme = b.addExecutable(.{
         .name = "gen_readme",
