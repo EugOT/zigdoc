@@ -392,18 +392,22 @@ fn walkStdLib(io: std.Io, arena: *std.heap.ArenaAllocator, std_dir_path: []const
         if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
         if (std.mem.endsWith(u8, entry.basename, "test.zig")) continue;
 
-        const file_content = try entry.dir.readFileAllocOptions(
+        // `Walk.parse` mutates the source buffer in place (writes a 0 sentinel
+        // over the trailing newline) so the buffer must be a true `[]u8`.
+        // `readFileAlloc` already returns mutable bytes, matching the calls in
+        // `walkBuildModules` (search "Walk.addFile" above). No `@constCast`
+        // is required and using it here would mask a real const-correctness
+        // violation if the upstream signature changed. See PR #1 review.
+        const file_content = try entry.dir.readFileAlloc(
             io,
             entry.basename,
             allocator,
             .limited(10 * 1024 * 1024),
-            .@"1",
-            0,
         );
 
         const file_name = try std.fmt.allocPrint(allocator, "std/{s}", .{entry.path});
 
-        _ = try Walk.addFile(file_name, @constCast(file_content));
+        _ = try Walk.addFile(file_name, file_content);
     }
 }
 
@@ -1032,4 +1036,36 @@ fn printSource(writer: anytype, ast: *const std.zig.Ast, node: std.zig.Ast.Node.
     while (lines.next()) |line| {
         try writer.print("  {s}\n", .{line});
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+// Pins the const-correctness contract between `Dir.readFileAlloc` and
+// `Walk.addFile`: PR #1 review (PRRT_kwDOST2NKs6AThMy) flagged a
+// `@constCast(file_content)` call where `Walk.parse` mutates the buffer in
+// place (writes a 0 sentinel over the trailing newline). The fix reads the
+// file via `readFileAlloc` whose return type is already mutable, so no
+// const-cast is required. If a future stdlib change makes `readFileAlloc`
+// return `[]const u8`, this test fails to compile and forces the issue
+// back into review instead of silently re-introducing the unsafe cast.
+test "readFileAlloc return is mutable []u8 (no @constCast needed for Walk.addFile)" {
+    const t = std.testing;
+    const Dir = std.Io.Dir;
+    const ReadAllocReturn = @typeInfo(@typeInfo(@TypeOf(Dir.readFileAlloc)).@"fn".return_type.?).error_union.payload;
+    const info = @typeInfo(ReadAllocReturn).pointer;
+    try t.expectEqual(false, info.is_const);
+    try t.expectEqual(@as(type, u8), info.child);
+
+    // `Walk.addFile`'s second parameter must remain `[]u8` (mutable).
+    // `Walk.parse` writes a 0 sentinel into the buffer in place; if the
+    // signature ever changed to `[]const u8`, callers would silently get
+    // away with `@constCast` again. Pin the contract via type introspection
+    // instead of compiling a real call (which would require Walk.init).
+    const fn_info = @typeInfo(@TypeOf(Walk.addFile)).@"fn";
+    const second_param = fn_info.params[1].type.?;
+    const second_info = @typeInfo(second_param).pointer;
+    try t.expectEqual(false, second_info.is_const);
+    try t.expectEqual(@as(type, u8), second_info.child);
 }
