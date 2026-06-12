@@ -6,11 +6,11 @@ const Ast = std.zig.Ast;
 const assert = std.debug.assert;
 const log = std.log;
 var gpa: std.mem.Allocator = undefined;
-var io_global: std.Io = undefined;
+var io: std.Io = undefined;
 
-pub fn init(allocator: std.mem.Allocator, io: std.Io) void {
+pub fn init(allocator: std.mem.Allocator, io_arg: std.Io) void {
     gpa = allocator;
-    io_global = io;
+    io = io_arg;
 }
 
 const Oom = error{OutOfMemory};
@@ -20,6 +20,21 @@ pub const Decl = @import("Decl.zig");
 pub var files: std.array_hash_map.String(File) = .empty;
 pub var decls: std.ArrayList(Decl) = .empty;
 pub var modules: std.array_hash_map.String(File.Index) = .empty;
+
+pub fn deinit() void {
+    for (files.values()) |*file| {
+        file.deinit();
+    }
+    for (files.keys()) |key| {
+        gpa.free(key);
+    }
+    files.deinit(gpa);
+    decls.deinit(gpa);
+    modules.deinit(gpa);
+    files = .empty;
+    decls = .empty;
+    modules = .empty;
+}
 
 file: File.Index,
 
@@ -69,6 +84,23 @@ pub const File = struct {
     /// struct/union/enum/opaque decl node => its namespace scope
     /// local var decl node => its local variable scope
     scopes: std.AutoArrayHashMapUnmanaged(Ast.Node.Index, *Scope) = .empty,
+    top_scope: ?*Scope = null,
+
+    fn deinit(file: *File) void {
+        file.ast.deinit(gpa);
+        file.ident_decls.deinit(gpa);
+        file.token_parents.deinit(gpa);
+        file.node_decls.deinit(gpa);
+        file.doctests.deinit(gpa);
+        for (file.scopes.values()) |scope| {
+            scope.destroy();
+        }
+        if (file.top_scope) |scope| {
+            scope.destroy();
+        }
+        file.scopes.deinit(gpa);
+        file.* = undefined;
+    }
 
     pub fn lookupToken(file: *File, token: Ast.TokenIndex) Decl.Index {
         const decl_node = file.ident_decls.get(token) orelse return .none;
@@ -339,19 +371,22 @@ pub const File = struct {
                     return Category.makeAlias(File.Index.findRootDecl(imported_file_index), node);
                 }
 
-                const resolved_path = if (std.fs.path.isAbsolute(file_path))
-                    std.Io.Dir.cwd().realPathFileAlloc(io_global, file_path, gpa) catch file_path
-                else blk: {
+                // Uniform ownership: `resolved_path` is always a fresh plain
+                // []u8. The realpath result is a [:0]u8 sentinel slice that
+                // must be freed with its exact type (see addFile), so re-dupe
+                // it instead of storing/freeing the coerced slice.
+                const resolved_path = if (std.fs.path.isAbsolute(file_path)) blk: {
+                    const real = std.Io.Dir.realPathFileAbsoluteAlloc(io, file_path, gpa) catch
+                        break :blk gpa.dupe(u8, file_path) catch @panic("OOM");
+                    defer gpa.free(real);
+                    break :blk gpa.dupe(u8, real) catch @panic("OOM");
+                } else blk: {
                     const base_path = file_index.path();
                     break :blk std.fs.path.resolve(gpa, &.{
                         base_path, "..", file_path,
                     }) catch @panic("OOM");
                 };
-                defer {
-                    if (!std.fs.path.isAbsolute(file_path) or resolved_path.ptr != file_path.ptr) {
-                        gpa.free(resolved_path);
-                    }
-                }
+                defer gpa.free(resolved_path);
 
                 log.debug("from '{s}' @import '{s}' resolved='{s}'", .{
                     file_index.path(), file_path, resolved_path,
@@ -363,7 +398,7 @@ pub const File = struct {
                     );
                 } else {
                     const import_content = std.Io.Dir.cwd().readFileAlloc(
-                        io_global,
+                        io,
                         resolved_path,
                         gpa,
                         .limited(10 * 1024 * 1024),
@@ -434,21 +469,44 @@ pub fn addFile(file_name: []const u8, bytes: []u8) !File.Index {
     const ast = try parse(file_name, bytes);
     assert(ast.errors.len == 0);
 
-    const normalized_path = std.Io.Dir.cwd().realPathFileAlloc(io_global, file_name, gpa) catch file_name;
+    // realPathFile*Alloc return sentinel slices ([:0]u8 — dupeZ allocates
+    // N+1 bytes). Re-dupe to a plain []u8 and free the sentinel original
+    // with its exact type, so `deinit` can later free every key with the
+    // correct allocation size (a [:0] key freed as []const u8 trips the
+    // DebugAllocator size check).
+    const normalized_path = blk: {
+        if (std.fs.path.isAbsolute(file_name)) {
+            if (std.Io.Dir.realPathFileAbsoluteAlloc(io, file_name, gpa)) |real| {
+                defer gpa.free(real);
+                break :blk try gpa.dupe(u8, real);
+            } else |_| {}
+        } else {
+            if (std.Io.Dir.cwd().realPathFileAlloc(io, file_name, gpa)) |real| {
+                defer gpa.free(real);
+                break :blk try gpa.dupe(u8, real);
+            } else |_| {}
+        }
+        break :blk try gpa.dupe(u8, file_name);
+    };
 
     // Check if this file already exists to avoid duplicate entries
     if (files.getIndex(normalized_path)) |existing_index| {
+        gpa.free(normalized_path);
         return @enumFromInt(existing_index);
     }
 
     const file_index: File.Index = @enumFromInt(files.entries.len);
-    try files.put(gpa, normalized_path, .{ .ast = ast });
+    files.put(gpa, normalized_path, .{ .ast = ast }) catch |err| {
+        gpa.free(normalized_path);
+        return err;
+    };
 
     var w: Walk = .{
         .file = file_index,
     };
     const scope = try gpa.create(Scope);
     scope.* = .{ .tag = .top };
+    file_index.get().top_scope = scope;
 
     const decl_index = try file_index.addDecl(.root, .none);
     try structDecl(&w, scope, decl_index, .root, ast.containerDeclRoot());
@@ -518,10 +576,37 @@ pub const Scope = struct {
     const Namespace = struct {
         base: Scope = .{ .tag = .namespace },
         parent: *Scope,
-        names: std.array_hash_map.String(Ast.Node.Index) = .empty,
-        doctests: std.array_hash_map.String(Ast.Node.Index) = .empty,
+        names: std.StringArrayHashMapUnmanaged(Ast.Node.Index) = .empty,
+        doctests: std.StringArrayHashMapUnmanaged(Ast.Node.Index) = .empty,
         decl_index: Decl.Index,
+
+        fn deinit(namespace: *Namespace) void {
+            namespace.names.deinit(gpa);
+            namespace.doctests.deinit(gpa);
+            namespace.* = undefined;
+        }
     };
+
+    fn destroy(self: *Scope) void {
+        switch (self.tag) {
+            .top => {
+                self.* = undefined;
+                gpa.destroy(self);
+            },
+            .local => {
+                const local: *Local = @alignCast(@fieldParentPtr("base", self));
+                self.* = undefined;
+                local.* = undefined;
+                gpa.destroy(local);
+            },
+            .namespace => {
+                const namespace: *Namespace = @alignCast(@fieldParentPtr("base", self));
+                namespace.deinit();
+                self.* = undefined;
+                gpa.destroy(namespace);
+            },
+        }
+    }
 
     fn getNamespaceDecl(start_scope: *Scope) Decl.Index {
         var it: *Scope = start_scope;
