@@ -6,11 +6,11 @@ const Ast = std.zig.Ast;
 const assert = std.debug.assert;
 const log = std.log;
 var gpa: std.mem.Allocator = undefined;
-var io_global: std.Io = undefined;
+var io: std.Io = undefined;
 
-pub fn init(allocator: std.mem.Allocator, io: std.Io) void {
+pub fn init(allocator: std.mem.Allocator, io_arg: std.Io) void {
     gpa = allocator;
-    io_global = io;
+    io = io_arg;
 }
 
 const Oom = error{OutOfMemory};
@@ -340,7 +340,7 @@ pub const File = struct {
                 }
 
                 const resolved_path = if (std.fs.path.isAbsolute(file_path))
-                    std.Io.Dir.cwd().realPathFileAlloc(io_global, file_path, gpa) catch file_path
+                    std.Io.Dir.realPathFileAbsoluteAlloc(io, file_path, gpa) catch file_path
                 else blk: {
                     const base_path = file_index.path();
                     break :blk std.fs.path.resolve(gpa, &.{
@@ -363,7 +363,7 @@ pub const File = struct {
                     );
                 } else {
                     const import_content = std.Io.Dir.cwd().readFileAlloc(
-                        io_global,
+                        io,
                         resolved_path,
                         gpa,
                         .limited(10 * 1024 * 1024),
@@ -434,7 +434,10 @@ pub fn addFile(file_name: []const u8, bytes: []u8) !File.Index {
     const ast = try parse(file_name, bytes);
     assert(ast.errors.len == 0);
 
-    const normalized_path = std.Io.Dir.cwd().realPathFileAlloc(io_global, file_name, gpa) catch file_name;
+    const normalized_path = if (std.fs.path.isAbsolute(file_name))
+        std.Io.Dir.realPathFileAbsoluteAlloc(io, file_name, gpa) catch file_name
+    else
+        std.Io.Dir.cwd().realPathFileAlloc(io, file_name, gpa) catch file_name;
 
     // Check if this file already exists to avoid duplicate entries
     if (files.getIndex(normalized_path)) |existing_index| {

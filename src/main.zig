@@ -4,6 +4,7 @@ const log = std.log.scoped(.zigdoc);
 
 const build_runner_0_14 = @embedFile("build_runner_0.14.zig");
 const build_runner_0_15 = @embedFile("build_runner_0.15.zig");
+const build_runner_0_16 = @embedFile("build_runner_0.16.zig");
 
 const template_build_zig = @embedFile("templates/build.zig.template");
 const template_main_zig = @embedFile("templates/main.zig.template");
@@ -13,16 +14,14 @@ const template_gitignore = @embedFile("templates/.gitignore.template");
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
+    const arena = init.arena;
     const io = init.io;
 
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
+    var args = try init.minimal.args.iterateAllocator(gpa);
+    defer args.deinit();
+    _ = args.skip(); // skip program name
 
-    var args_iter = try init.minimal.args.iterateAllocator(arena.allocator());
-    defer args_iter.deinit();
-    _ = args_iter.skip(); // skip program name
-
-    const symbol = args_iter.next();
+    const symbol = args.next();
 
     if (symbol == null) {
         try printUsage(io);
@@ -35,7 +34,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (std.mem.eql(u8, symbol.?, "--dump-imports")) {
-        try dumpImports(io, &arena);
+        try dumpImports(io, arena);
         return;
     }
 
@@ -47,18 +46,18 @@ pub fn main(init: std.process.Init) !void {
     Walk.init(arena.allocator(), io);
     Walk.Decl.init(arena.allocator());
 
-    const std_dir_path = try getStdDir(io, &arena);
+    const std_dir_path = try getStdDir(io, arena);
 
     // Only parse std library if the symbol starts with "std"
     if (std.mem.startsWith(u8, symbol.?, "std")) {
-        try walkStdLib(io, &arena, std_dir_path);
+        try walkStdLib(io, arena, std_dir_path);
 
         // Register std/std.zig as the "std" module for @import("std")
         const std_file_index = Walk.files.getIndex("std/std.zig") orelse return error.StdNotFound;
         try Walk.modules.put(arena.allocator(), "std", @enumFromInt(std_file_index));
     } else {
         // For non-std symbols, process build.zig to get imported modules
-        try processBuildZig(io, &arena);
+        try processBuildZig(io, arena);
     }
 
     try printDocs(arena.allocator(), io, symbol.?, std_dir_path);
@@ -90,8 +89,7 @@ fn printUsage(io: std.Io) !void {
         \\  @init             Initialize a new Zig project with AGENTS.md
         \\
     );
-    try stdout_writer.interface.flush();
-    try stdout_writer.end();
+    try stdout_writer.flush();
 }
 
 fn initProject(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -104,9 +102,8 @@ fn initProject(allocator: std.mem.Allocator, io: std.Io) !void {
     } else |_| {}
 
     // Get project name from current directory
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd_path_len = try cwd.realPath(io, &path_buf);
-    const cwd_path = path_buf[0..cwd_path_len];
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd_path = path_buf[0..try std.process.currentPath(io, &path_buf)];
     const name = std.fs.path.basename(cwd_path);
 
     // Create src directory
@@ -128,7 +125,6 @@ fn initProject(allocator: std.mem.Allocator, io: std.Io) !void {
     // Run zig build to get suggested fingerprint from error message
     const result = std.process.run(allocator, io, .{
         .argv = &.{ "zig", "build" },
-        .stdout_limit = .limited(1024 * 1024),
     }) catch {
         std.debug.print("Initialized Zig project '{s}' (run 'zig build' to generate fingerprint)\n", .{name});
         return;
@@ -156,15 +152,31 @@ fn initProject(allocator: std.mem.Allocator, io: std.Io) !void {
 }
 
 fn substitute(allocator: std.mem.Allocator, template: []const u8, name: []const u8) ![]const u8 {
-    const sanitized = try std.mem.replaceOwned(u8, allocator, name, "-", "_");
+    const sanitized = try sanitizeName(allocator, name);
     return std.mem.replaceOwned(u8, allocator, template, "{{name}}", sanitized);
 }
 
-fn dumpImports(io: std.Io, arena: *std.heap.ArenaAllocator) !void {
-    const cwd = std.Io.Dir.cwd();
+fn sanitizeName(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    const needs_prefix = name.len == 0 or std.ascii.isDigit(name[0]);
+    const result = try allocator.alloc(u8, name.len + @intFromBool(needs_prefix));
+    var index: usize = 0;
 
+    if (needs_prefix) {
+        result[index] = '_';
+        index += 1;
+    }
+
+    for (name) |c| {
+        result[index] = if (std.ascii.isAlphanumeric(c) or c == '_') c else '_';
+        index += 1;
+    }
+
+    return result;
+}
+
+fn dumpImports(io: std.Io, arena: *std.heap.ArenaAllocator) !void {
     // Check if build.zig exists
-    cwd.access(io, "build.zig", .{}) catch {
+    std.Io.Dir.cwd().access(io, "build.zig", .{}) catch {
         std.debug.print("No build.zig found in current directory\n", .{});
         return error.NoBuildZig;
     };
@@ -180,41 +192,35 @@ fn dumpImports(io: std.Io, arena: *std.heap.ArenaAllocator) !void {
             "--build-runner",
             ".zig-cache/zigdoc_build_runner.zig",
         },
-        .stdout_limit = .limited(64 * 1024 * 1024),
     });
 
-    switch (result.term) {
-        .exited => |code| if (code != 0) {
-            std.debug.print("Error running build runner:\n{s}\n", .{result.stderr});
-            return error.BuildRunnerFailed;
-        },
-        else => {
-            std.debug.print("Build runner terminated abnormally:\n{s}\n", .{result.stderr});
-            return error.BuildRunnerFailed;
-        },
+    if (!childExitedSuccessfully(result.term)) {
+        std.debug.print("Error running build runner:\n{s}\n", .{result.stderr});
+        return error.BuildRunnerFailed;
     }
 
     // Print the JSON output directly
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buf);
-    try stdout_writer.interface.writeAll(result.stdout);
-    try stdout_writer.interface.flush();
-    try stdout_writer.end();
+    try std.Io.File.stdout().writeStreamingAll(io, result.stdout);
 }
 
 const ZigEnv = struct {
     std_dir: []const u8,
 };
 
+fn childExitedSuccessfully(term: std.process.Child.Term) bool {
+    return switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
 fn getZigVersion(io: std.Io, arena: *std.heap.ArenaAllocator) !std.SemanticVersion {
     const version_result = try std.process.run(arena.allocator(), io, .{
         .argv = &[_][]const u8{ "zig", "version" },
-        .stdout_limit = .limited(4 * 1024),
     });
 
-    switch (version_result.term) {
-        .exited => |code| if (code != 0) return error.ZigVersionFailed,
-        else => return error.ZigVersionFailed,
+    if (!childExitedSuccessfully(version_result.term)) {
+        return error.ZigVersionFailed;
     }
 
     const version_str = std.mem.trim(u8, version_result.stdout, &std.ascii.whitespace);
@@ -224,30 +230,28 @@ fn getZigVersion(io: std.Io, arena: *std.heap.ArenaAllocator) !std.SemanticVersi
 fn setupBuildRunner(io: std.Io, arena: *std.heap.ArenaAllocator) !void {
     const version = try getZigVersion(io, arena);
 
-    const runner_src = switch (version.minor) {
+    const runner_src = if (version.major == 0) switch (version.minor) {
         14 => build_runner_0_14,
-        15, 16 => build_runner_0_15,
+        15 => build_runner_0_15,
+        16 => build_runner_0_16,
         else => return error.UnsupportedZigVersion,
-    };
+    } else return error.UnsupportedZigVersion;
 
-    const cwd = std.Io.Dir.cwd();
-    cwd.createDir(io, ".zig-cache", .default_dir) catch |err| switch (err) {
+    std.Io.Dir.cwd().createDir(io, ".zig-cache", .default_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
 
     const runner_path = ".zig-cache/zigdoc_build_runner.zig";
-    try cwd.writeFile(io, .{
+    try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = runner_path,
         .data = runner_src,
     });
 }
 
 fn processBuildZig(io: std.Io, arena: *std.heap.ArenaAllocator) !void {
-    const cwd = std.Io.Dir.cwd();
-
     // Check if build.zig exists
-    cwd.access(io, "build.zig", .{}) catch {
+    std.Io.Dir.cwd().access(io, "build.zig", .{}) catch {
         // No build.zig, nothing to do
         return;
     };
@@ -263,18 +267,11 @@ fn processBuildZig(io: std.Io, arena: *std.heap.ArenaAllocator) !void {
             "--build-runner",
             ".zig-cache/zigdoc_build_runner.zig",
         },
-        .stdout_limit = .limited(64 * 1024 * 1024),
     });
 
-    switch (result.term) {
-        .exited => |code| if (code != 0) {
-            log.err("Failed to analyze build.zig", .{});
-            return;
-        },
-        else => {
-            log.err("Failed to analyze build.zig", .{});
-            return;
-        },
+    if (!childExitedSuccessfully(result.term)) {
+        log.err("Failed to analyze build.zig", .{});
+        return;
     }
 
     // Parse the output to extract module information
@@ -288,8 +285,6 @@ fn parseBuildOutput(allocator: std.mem.Allocator, io: std.Io, output: []const u8
     const root_obj = parsed.value.object;
     const modules_obj = root_obj.get("modules") orelse return;
 
-    const cwd = std.Io.Dir.cwd();
-
     var modules_iter = modules_obj.object.iterator();
     while (modules_iter.next()) |entry| {
         const module_name = entry.key_ptr.*;
@@ -301,7 +296,7 @@ fn parseBuildOutput(allocator: std.mem.Allocator, io: std.Io, output: []const u8
         if (!std.mem.endsWith(u8, root_path, ".zig")) continue;
 
         // Read and add the module file
-        const file_content = cwd.readFileAlloc(
+        const file_content = std.Io.Dir.cwd().readFileAlloc(
             io,
             root_path,
             allocator,
@@ -325,7 +320,7 @@ fn parseBuildOutput(allocator: std.mem.Allocator, io: std.Io, output: []const u8
                 if (!std.mem.endsWith(u8, import_path, ".zig")) continue;
 
                 // Read and add the imported file
-                const import_content = cwd.readFileAlloc(
+                const import_content = std.Io.Dir.cwd().readFileAlloc(
                     io,
                     import_path,
                     allocator,
@@ -349,12 +344,10 @@ fn getStdDir(io: std.Io, arena: *std.heap.ArenaAllocator) ![]const u8 {
 
     const result = try std.process.run(arena.allocator(), io, .{
         .argv = &[_][]const u8{ "zig", "env" },
-        .stdout_limit = .limited(64 * 1024),
     });
 
-    switch (result.term) {
-        .exited => |code| if (code != 0) return error.ZigEnvFailed,
-        else => return error.ZigEnvFailed,
+    if (!childExitedSuccessfully(result.term)) {
+        return error.ZigEnvFailed;
     }
 
     const stdout = try arena.allocator().dupeZ(u8, result.stdout);
@@ -392,17 +385,13 @@ fn walkStdLib(io: std.Io, arena: *std.heap.ArenaAllocator, std_dir_path: []const
         if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
         if (std.mem.endsWith(u8, entry.basename, "test.zig")) continue;
 
-        // `Walk.parse` mutates the source buffer in place (writes a 0 sentinel
-        // over the trailing newline) so the buffer must be a true `[]u8`.
-        // `readFileAlloc` already returns mutable bytes, matching the calls in
-        // `walkBuildModules` (search "Walk.addFile" above). No `@constCast`
-        // is required and using it here would mask a real const-correctness
-        // violation if the upstream signature changed. See PR #1 review.
-        const file_content = try entry.dir.readFileAlloc(
+        const file_content = try entry.dir.readFileAllocOptions(
             io,
             entry.basename,
             allocator,
             .limited(10 * 1024 * 1024),
+            .of(u8),
+            null,
         );
 
         const file_name = try std.fmt.allocPrint(allocator, "std/{s}", .{entry.path});
@@ -570,7 +559,6 @@ fn printDocs(allocator: std.mem.Allocator, io: std.Io, symbol: []const u8, std_d
         if (try resolveHierarchical(allocator, symbol)) |decl| {
             try printDeclInfo(allocator, stdout, decl, symbol, std_dir_path);
             try stdout.flush();
-            try stdout_writer.end();
             return;
         }
     }
@@ -607,7 +595,6 @@ fn printDocs(allocator: std.mem.Allocator, io: std.Io, symbol: []const u8, std_d
         const first_part = parts.next() orelse {
             try stdout.writeAll("Tip: Specify a symbol like 'std.ArrayList' or 'moduleName.Symbol'\n");
             try stdout.flush();
-            try stdout_writer.end();
             std.process.exit(1);
         };
 
@@ -640,12 +627,10 @@ fn printDocs(allocator: std.mem.Allocator, io: std.Io, symbol: []const u8, std_d
         }
 
         try stdout.flush();
-        try stdout_writer.end();
         std.process.exit(1);
     }
 
     try stdout.flush();
-    try stdout_writer.end();
 }
 
 fn printMembers(allocator: std.mem.Allocator, writer: anytype, decl: *const Walk.Decl, category: Walk.Category) !bool {
@@ -1036,36 +1021,4 @@ fn printSource(writer: anytype, ast: *const std.zig.Ast, node: std.zig.Ast.Node.
     while (lines.next()) |line| {
         try writer.print("  {s}\n", .{line});
     }
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-// Pins the const-correctness contract between `Dir.readFileAlloc` and
-// `Walk.addFile`: PR #1 review (PRRT_kwDOST2NKs6AThMy) flagged a
-// `@constCast(file_content)` call where `Walk.parse` mutates the buffer in
-// place (writes a 0 sentinel over the trailing newline). The fix reads the
-// file via `readFileAlloc` whose return type is already mutable, so no
-// const-cast is required. If a future stdlib change makes `readFileAlloc`
-// return `[]const u8`, this test fails to compile and forces the issue
-// back into review instead of silently re-introducing the unsafe cast.
-test "readFileAlloc return is mutable []u8 (no @constCast needed for Walk.addFile)" {
-    const t = std.testing;
-    const Dir = std.Io.Dir;
-    const ReadAllocReturn = @typeInfo(@typeInfo(@TypeOf(Dir.readFileAlloc)).@"fn".return_type.?).error_union.payload;
-    const info = @typeInfo(ReadAllocReturn).pointer;
-    try t.expectEqual(false, info.is_const);
-    try t.expectEqual(@as(type, u8), info.child);
-
-    // `Walk.addFile`'s second parameter must remain `[]u8` (mutable).
-    // `Walk.parse` writes a 0 sentinel into the buffer in place; if the
-    // signature ever changed to `[]const u8`, callers would silently get
-    // away with `@constCast` again. Pin the contract via type introspection
-    // instead of compiling a real call (which would require Walk.init).
-    const fn_info = @typeInfo(@TypeOf(Walk.addFile)).@"fn";
-    const second_param = fn_info.params[1].type.?;
-    const second_info = @typeInfo(second_param).pointer;
-    try t.expectEqual(false, second_info.is_const);
-    try t.expectEqual(@as(type, u8), second_info.child);
 }
