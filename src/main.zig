@@ -139,10 +139,16 @@ fn initProject(allocator: std.mem.Allocator, io: std.Io) !void {
     // Run zig build to get suggested fingerprint from error message
     const result = std.process.run(allocator, io, .{
         .argv = &.{ "zig", "build" },
+        // Cap captured output so a misbehaving build cannot exhaust memory.
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(1024 * 1024),
     }) catch {
         std.debug.print("Initialized Zig project '{s}' (run 'zig build' to generate fingerprint)\n", .{name});
         return;
     };
+    // `run` returns caller-owned stdout/stderr buffers; free both.
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
 
     // Parse fingerprint from error: "suggested value: 0x..."
     if (std.mem.find(u8, result.stderr, "suggested value: ")) |start| {
@@ -287,8 +293,10 @@ fn processBuildZig(io: std.Io, arena: *std.heap.ArenaAllocator) !void {
     });
 
     if (!childExitedSuccessfully(result.term)) {
-        log.err("Failed to analyze build.zig", .{});
-        return;
+        log.err("Failed to analyze build.zig:\n{s}", .{result.stderr});
+        // Propagate the failure instead of continuing with zero modules,
+        // which would make valid symbols look like missing symbols.
+        return error.BuildRunnerFailed;
     }
 
     // Parse the output to extract module information

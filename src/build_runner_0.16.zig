@@ -148,8 +148,14 @@ pub fn main(init: process.Init.Minimal) !void {
             if (!first_module) try stdout.writer.writeAll(",\n");
             first_module = false;
 
-            try stdout.writer.print("    \"{s}\": {{\n", .{import_name});
-            try stdout.writer.print("      \"root\": \"{s}\"", .{root_path});
+            // Module names and paths may contain characters that must be
+            // escaped to keep the output valid JSON (e.g. backslashes on
+            // Windows paths, or quotes). Encode them with the JSON encoder
+            // rather than printing raw with "{s}".
+            try stdout.writer.writeAll("    ");
+            try std.json.Stringify.encodeJsonString(import_name, .{}, &stdout.writer);
+            try stdout.writer.writeAll(": {\n      \"root\": ");
+            try std.json.Stringify.encodeJsonString(root_path, .{}, &stdout.writer);
 
             if (module.import_table.count() > 0) {
                 try stdout.writer.writeAll(",\n      \"imports\": {\n");
@@ -165,7 +171,10 @@ pub fn main(init: process.Init.Minimal) !void {
                     if (dep_root) |droot| {
                         if (!first_dep) try stdout.writer.writeAll(",\n");
                         first_dep = false;
-                        try stdout.writer.print("        \"{s}\": \"{s}\"", .{ dep_name, droot });
+                        try stdout.writer.writeAll("        ");
+                        try std.json.Stringify.encodeJsonString(dep_name, .{}, &stdout.writer);
+                        try stdout.writer.writeAll(": ");
+                        try std.json.Stringify.encodeJsonString(droot, .{}, &stdout.writer);
                     }
                 }
                 try stdout.writer.writeAll("\n      }\n");

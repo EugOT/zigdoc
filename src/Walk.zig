@@ -17,9 +17,9 @@ const Oom = error{OutOfMemory};
 
 pub const Decl = @import("Decl.zig");
 
-pub var files: std.StringArrayHashMapUnmanaged(File) = .empty;
+pub var files: std.array_hash_map.String(File) = .empty;
 pub var decls: std.ArrayList(Decl) = .empty;
-pub var modules: std.StringArrayHashMapUnmanaged(File.Index) = .empty;
+pub var modules: std.array_hash_map.String(File.Index) = .empty;
 
 pub fn deinit() void {
     for (files.values()) |*file| {
