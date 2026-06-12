@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .ziglint = .{
-            .url = "git+https://github.com/EugOT/ziglint.git?ref=main#e5612280f345fcd808f9a2562a1b5964b45b9b42",
-            .hash = "ziglint-0.5.2-t0bwLz2XBQCgnA0PTY0KM9YgrmdjLU7wwjXablNijOuq",
+            .url = "git+https://github.com/EugOT/ziglint.git?ref=main#a2fa56aa6a26181f9d6f586203fe65fc6c4c11c9",
+            .hash = "ziglint-0.5.2-t0bwLzCwBQA69qkf9xumLCiu4N7jqxuzjBy8Abpga7v9",
         },
     },
     .paths = .{

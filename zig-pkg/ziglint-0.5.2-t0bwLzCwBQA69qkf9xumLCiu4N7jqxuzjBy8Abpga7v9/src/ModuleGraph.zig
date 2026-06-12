@@ -17,13 +17,18 @@ root_dir: []const u8,
 modules: std.StringHashMapUnmanaged(Module),
 
 pub const Module = struct {
-    path: []const u8,
+    /// Sentinel-terminated to match the buffer returned by `realPathFileAlloc`,
+    /// which allocates `len + 1` bytes. Storing it as `[:0]const u8` keeps the
+    /// free path size-accurate (no implicit slice-shortening) and avoids the
+    /// previous "alloc then dupe" double allocation. The sentinel is a useful
+    /// extra (paths can be passed to libc-style APIs without re-duping).
+    path: [:0]const u8,
     source: [:0]const u8,
     tree: Ast,
     zir: ?Zir = null,
 };
 
-pub fn init(io: std.Io, allocator: std.mem.Allocator, root_source: []const u8, zig_lib_path: ?[]const u8) !ModuleGraph {
+pub fn init(allocator: std.mem.Allocator, io: std.Io, root_source: []const u8, zig_lib_path: ?[]const u8) !ModuleGraph {
     const root_dir = std.fs.path.dirname(root_source) orelse ".";
 
     var graph: ModuleGraph = .{
@@ -56,9 +61,15 @@ pub fn addModulePublic(self: *ModuleGraph, path: []const u8) void {
 }
 
 fn addModule(self: *ModuleGraph, path: []const u8) !void {
-    const canonical_z = try std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.allocator);
-    defer self.allocator.free(canonical_z);
-    const canonical = try self.allocator.dupe(u8, canonical_z);
+    // `realPathFileAlloc` returns a sentinel-terminated `[:0]u8` (allocated as
+    // `len + 1` bytes). We store the canonical path with its sentinel intact so
+    // the matching `free` later sees the same slice it was allocated as -- this
+    // is what avoids the "Allocation size N+1 vs free size N" debug-allocator
+    // panic. The graph owns this buffer for its lifetime; it is freed in
+    // `deinit`. No extra `dupe` is needed (the previous code did one purely to
+    // strip the sentinel for typing reasons).
+    const canonical: [:0]const u8 = try std.Io.Dir.cwd().realPathFileAlloc(self.io, path, self.allocator);
+    errdefer self.allocator.free(canonical);
 
     if (self.modules.contains(canonical)) {
         self.allocator.free(canonical);
@@ -280,7 +291,7 @@ test "parse simple module" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "main.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     try std.testing.expectEqual(1, graph.moduleCount());
@@ -297,7 +308,7 @@ test "resolve relative import" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "main.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     try std.testing.expectEqual(2, graph.moduleCount());
@@ -313,7 +324,7 @@ test "handle missing import gracefully" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "main.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     try std.testing.expectEqual(1, graph.moduleCount());
@@ -334,7 +345,7 @@ test "no duplicate modules" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "main.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     // main.zig, other.zig, shared.zig - no duplicates

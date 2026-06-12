@@ -446,6 +446,12 @@ fn findDeclInModule(self: *TypeResolver, tree: *const Ast, name: []const u8, mod
                         if (std.mem.endsWith(u8, import_str, ".zig")) {
                             const module_dir = std.fs.path.dirname(module_path) orelse ".";
                             const resolved = std.fs.path.join(self.allocator, &.{ module_dir, import_str }) catch continue;
+                            // `realPathFileAlloc` returns a sentinel-terminated `[:0]u8`
+                            // (allocated `len + 1`). We dupe into a plain `[]u8` so the
+                            // returned `DeclResult.import_path` type-matches the non-sentinel
+                            // sibling (`current_module_path`) used by callers, which uniformly
+                            // free the slice with the same length they received -- avoiding the
+                            // sentinel/non-sentinel size mismatch in DebugAllocator.
                             const canonical_z = std.Io.Dir.cwd().realPathFileAlloc(self.graph.io, resolved, self.allocator) catch {
                                 self.allocator.free(resolved);
                                 continue;
@@ -485,8 +491,22 @@ fn findMethodInModule(self: *TypeResolver, module_path: []const u8, type_name: [
     return self.findMethodInType(tree, type_node, method_name, mod.path);
 }
 
+/// Alias chains (`const a = b;`) are followed at most this many hops so
+/// cyclic aliases (`const a = b; const b = a;`) cannot recurse unbounded.
+const max_alias_depth: u32 = 32;
+
 /// For file-as-struct modules (like fs/File.zig), look for methods in root declarations.
 fn findMethodInFileAsStruct(self: *TypeResolver, module_path: []const u8, method_name: []const u8) ?MethodDef {
+    return self.findMethodInFileAsStructDepth(module_path, method_name, 0);
+}
+
+fn findMethodInFileAsStructDepth(
+    self: *TypeResolver,
+    module_path: []const u8,
+    method_name: []const u8,
+    depth: u32,
+) ?MethodDef {
+    if (depth >= max_alias_depth) return null;
     self.graph.addModulePublic(module_path);
     const mod = self.graph.getModule(module_path) orelse return null;
     const tree = &mod.tree;
@@ -524,7 +544,7 @@ fn findMethodInFileAsStruct(self: *TypeResolver, module_path: []const u8, method
                 // It's an alias like `const ArrayListUnmanaged = ArrayList;`
                 // Follow the alias to find the actual function
                 const alias_target = tree.tokenSlice(tree.nodeMainToken(init_node));
-                return self.findMethodInFileAsStruct(module_path, alias_target);
+                return self.findMethodInFileAsStructDepth(module_path, alias_target, depth + 1);
             } else if (init_tag == .fn_decl) {
                 // Inline function definition
                 var buf: [1]Ast.Node.Index = undefined;
@@ -816,9 +836,10 @@ fn resolveFieldAccess(self: *TypeResolver, tree: *const Ast, node: Ast.Node.Inde
             return .{ .std_type = .{ .path = full_path } };
         },
         .user_type => {
-            // Accessing a field on a user type - could be a nested type
-            const full_path = self.buildStdTypePath(tree, node);
-            return .{ .std_type = .{ .path = full_path } };
+            // A field access on a user-defined type is not a stdlib type.
+            // Coercing it into `.std_type` conflated user namespaces with
+            // `std` ones and misrouted downstream semantic resolution.
+            return .unknown;
         },
         .unknown => {
             const lhs_tag = tree.nodeTag(lhs_node);
@@ -1107,9 +1128,9 @@ fn resolveNumberLiteral(_: *TypeResolver, tree: *const Ast, node: Ast.Node.Index
     const main_token = tree.nodeMainToken(node);
     const text = tree.tokenSlice(main_token);
 
-    if (std.mem.indexOf(u8, text, ".") != null or
-        std.mem.indexOf(u8, text, "e") != null or
-        std.mem.indexOf(u8, text, "E") != null)
+    if (std.mem.find(u8, text, ".") != null or
+        std.mem.find(u8, text, "e") != null or
+        std.mem.find(u8, text, "E") != null)
     {
         return .{ .primitive = .comptime_float };
     }
@@ -1208,7 +1229,7 @@ test "resolve primitive types" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1236,7 +1257,7 @@ test "resolve bool literal" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1262,7 +1283,7 @@ test "resolve import std" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1287,7 +1308,7 @@ test "resolve function returns type" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1312,7 +1333,7 @@ test "resolve number literal int" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1338,7 +1359,7 @@ test "resolve number literal float" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1367,7 +1388,7 @@ test "resolve field access on std" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1398,7 +1419,7 @@ test "resolve nested field access std.fs.File" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1429,7 +1450,7 @@ test "resolve field access on aliased std import" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1460,7 +1481,7 @@ test "resolve nested field access on aliased std import" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1488,7 +1509,7 @@ test "resolve string literal" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1513,7 +1534,7 @@ test "resolve function declaration" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1542,7 +1563,7 @@ test "find method in user type" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1570,7 +1591,7 @@ test "find method not found returns null" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1592,7 +1613,7 @@ test "find method in std_type without zig_lib_path returns null" {
     defer std.testing.allocator.free(path);
 
     // No zig_lib_path, so stdlib can't be resolved
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1620,7 +1641,7 @@ test "resolve function call return type" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1648,7 +1669,7 @@ test "resolve function call returning bool" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1680,7 +1701,7 @@ test "resolve method call return type" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1708,7 +1729,7 @@ test "resolve type-returning function call" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1732,7 +1753,7 @@ test "resolve unknown function call" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1754,7 +1775,7 @@ test "isTypeRef: struct declaration" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1778,7 +1799,7 @@ test "isTypeRef: instance with type annotation" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1800,7 +1821,7 @@ test "isTypeRef: primitive typed variable" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1821,7 +1842,7 @@ test "isTypeRef: explicit type annotation" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1842,7 +1863,7 @@ test "isTypeRef: enum declaration" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1868,7 +1889,7 @@ test "isTypeRef: function call returning type" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1894,7 +1915,7 @@ test "isTypeRef: function call returning value" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1918,7 +1939,7 @@ test "isTypeRef: identifier resolving to struct" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1945,7 +1966,7 @@ test "isTypeRef: identifier resolving to instance" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1974,7 +1995,7 @@ test "findFnInCurrentModule: type function" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -1998,7 +2019,7 @@ test "findFnInCurrentModule: direct function" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -2023,7 +2044,7 @@ test "findFnInCurrentModule: const alias to function" {
     const path = try tmp_dir.dir.realPathFileAlloc(io, "test.zig", std.testing.allocator);
     defer std.testing.allocator.free(path);
 
-    var graph = try ModuleGraph.init(io, std.testing.allocator, path, null);
+    var graph = try ModuleGraph.init(std.testing.allocator, io, path, null);
     defer graph.deinit();
 
     var resolver: TypeResolver = .init(std.testing.allocator, &graph);
@@ -2037,5 +2058,5 @@ test "findFnInCurrentModule: const alias to function" {
     const doc = doc_comments.getDocComment(std.testing.allocator, &mod.tree, method_def.?.node);
     defer if (doc) |d| std.testing.allocator.free(d);
     try std.testing.expect(doc != null);
-    try std.testing.expect(std.mem.indexOf(u8, doc.?, "Deprecated") != null);
+    try std.testing.expect(std.mem.find(u8, doc.?, "Deprecated") != null);
 }
