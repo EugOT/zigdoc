@@ -46,7 +46,13 @@ pub fn main(init: std.process.Init) !void {
     Walk.init(arena.allocator(), io);
     Walk.Decl.init(arena.allocator());
 
-    const std_dir_path = try getStdDir(io, arena);
+    const std_dir_path = getStdDir(io, arena) catch |err| switch (err) {
+        error.ZigNotFound => {
+            try printZigNotFound(io);
+            std.process.exit(1);
+        },
+        else => return err,
+    };
 
     // Only parse std library if the symbol starts with "std"
     if (std.mem.startsWith(u8, symbol.?, "std")) {
@@ -90,6 +96,14 @@ fn printUsage(io: std.Io) !void {
         \\
     );
     try stdout_writer.flush();
+}
+
+fn printZigNotFound(io: std.Io) !void {
+    try std.Io.File.stderr().writeStreamingAll(io,
+        \\Error: 'zig' command not found.
+        \\Please ensure Zig is installed and available in your PATH.
+        \\
+    );
 }
 
 fn initProject(allocator: std.mem.Allocator, io: std.Io) !void {
@@ -215,9 +229,12 @@ fn childExitedSuccessfully(term: std.process.Child.Term) bool {
 }
 
 fn getZigVersion(io: std.Io, arena: *std.heap.ArenaAllocator) !std.SemanticVersion {
-    const version_result = try std.process.run(arena.allocator(), io, .{
+    const version_result = std.process.run(arena.allocator(), io, .{
         .argv = &[_][]const u8{ "zig", "version" },
-    });
+    }) catch |err| switch (err) {
+        error.FileNotFound => return error.ZigNotFound,
+        else => return err,
+    };
 
     if (!childExitedSuccessfully(version_result.term)) {
         return error.ZigVersionFailed;

@@ -17,9 +17,21 @@ const Oom = error{OutOfMemory};
 
 pub const Decl = @import("Decl.zig");
 
-pub var files: std.array_hash_map.String(File) = .empty;
+pub var files: std.StringArrayHashMapUnmanaged(File) = .empty;
 pub var decls: std.ArrayList(Decl) = .empty;
-pub var modules: std.array_hash_map.String(File.Index) = .empty;
+pub var modules: std.StringArrayHashMapUnmanaged(File.Index) = .empty;
+
+pub fn deinit() void {
+    for (files.values()) |*file| {
+        file.deinit();
+    }
+    files.deinit(gpa);
+    decls.deinit(gpa);
+    modules.deinit(gpa);
+    files = .empty;
+    decls = .empty;
+    modules = .empty;
+}
 
 file: File.Index,
 
@@ -69,6 +81,23 @@ pub const File = struct {
     /// struct/union/enum/opaque decl node => its namespace scope
     /// local var decl node => its local variable scope
     scopes: std.AutoArrayHashMapUnmanaged(Ast.Node.Index, *Scope) = .empty,
+    top_scope: ?*Scope = null,
+
+    fn deinit(file: *File) void {
+        file.ast.deinit(gpa);
+        file.ident_decls.deinit(gpa);
+        file.token_parents.deinit(gpa);
+        file.node_decls.deinit(gpa);
+        file.doctests.deinit(gpa);
+        for (file.scopes.values()) |scope| {
+            scope.destroy();
+        }
+        if (file.top_scope) |scope| {
+            scope.destroy();
+        }
+        file.scopes.deinit(gpa);
+        file.* = undefined;
+    }
 
     pub fn lookupToken(file: *File, token: Ast.TokenIndex) Decl.Index {
         const decl_node = file.ident_decls.get(token) orelse return .none;
@@ -452,6 +481,7 @@ pub fn addFile(file_name: []const u8, bytes: []u8) !File.Index {
     };
     const scope = try gpa.create(Scope);
     scope.* = .{ .tag = .top };
+    file_index.get().top_scope = scope;
 
     const decl_index = try file_index.addDecl(.root, .none);
     try structDecl(&w, scope, decl_index, .root, ast.containerDeclRoot());
@@ -521,10 +551,37 @@ pub const Scope = struct {
     const Namespace = struct {
         base: Scope = .{ .tag = .namespace },
         parent: *Scope,
-        names: std.array_hash_map.String(Ast.Node.Index) = .empty,
-        doctests: std.array_hash_map.String(Ast.Node.Index) = .empty,
+        names: std.StringArrayHashMapUnmanaged(Ast.Node.Index) = .empty,
+        doctests: std.StringArrayHashMapUnmanaged(Ast.Node.Index) = .empty,
         decl_index: Decl.Index,
+
+        fn deinit(namespace: *Namespace) void {
+            namespace.names.deinit(gpa);
+            namespace.doctests.deinit(gpa);
+            namespace.* = undefined;
+        }
     };
+
+    fn destroy(self: *Scope) void {
+        switch (self.tag) {
+            .top => {
+                self.* = undefined;
+                gpa.destroy(self);
+            },
+            .local => {
+                const local: *Local = @alignCast(@fieldParentPtr("base", self));
+                self.* = undefined;
+                local.* = undefined;
+                gpa.destroy(local);
+            },
+            .namespace => {
+                const namespace: *Namespace = @alignCast(@fieldParentPtr("base", self));
+                namespace.deinit();
+                self.* = undefined;
+                gpa.destroy(namespace);
+            },
+        }
+    }
 
     fn getNamespaceDecl(start_scope: *Scope) Decl.Index {
         var it: *Scope = start_scope;
