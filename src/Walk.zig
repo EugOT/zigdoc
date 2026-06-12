@@ -25,6 +25,9 @@ pub fn deinit() void {
     for (files.values()) |*file| {
         file.deinit();
     }
+    for (files.keys()) |key| {
+        gpa.free(key);
+    }
     files.deinit(gpa);
     decls.deinit(gpa);
     modules.deinit(gpa);
@@ -368,19 +371,22 @@ pub const File = struct {
                     return Category.makeAlias(File.Index.findRootDecl(imported_file_index), node);
                 }
 
-                const resolved_path = if (std.fs.path.isAbsolute(file_path))
-                    std.Io.Dir.realPathFileAbsoluteAlloc(io, file_path, gpa) catch file_path
-                else blk: {
+                // Uniform ownership: `resolved_path` is always a fresh plain
+                // []u8. The realpath result is a [:0]u8 sentinel slice that
+                // must be freed with its exact type (see addFile), so re-dupe
+                // it instead of storing/freeing the coerced slice.
+                const resolved_path = if (std.fs.path.isAbsolute(file_path)) blk: {
+                    const real = std.Io.Dir.realPathFileAbsoluteAlloc(io, file_path, gpa) catch
+                        break :blk gpa.dupe(u8, file_path) catch @panic("OOM");
+                    defer gpa.free(real);
+                    break :blk gpa.dupe(u8, real) catch @panic("OOM");
+                } else blk: {
                     const base_path = file_index.path();
                     break :blk std.fs.path.resolve(gpa, &.{
                         base_path, "..", file_path,
                     }) catch @panic("OOM");
                 };
-                defer {
-                    if (!std.fs.path.isAbsolute(file_path) or resolved_path.ptr != file_path.ptr) {
-                        gpa.free(resolved_path);
-                    }
-                }
+                defer gpa.free(resolved_path);
 
                 log.debug("from '{s}' @import '{s}' resolved='{s}'", .{
                     file_index.path(), file_path, resolved_path,
@@ -463,18 +469,37 @@ pub fn addFile(file_name: []const u8, bytes: []u8) !File.Index {
     const ast = try parse(file_name, bytes);
     assert(ast.errors.len == 0);
 
-    const normalized_path = if (std.fs.path.isAbsolute(file_name))
-        std.Io.Dir.realPathFileAbsoluteAlloc(io, file_name, gpa) catch file_name
-    else
-        std.Io.Dir.cwd().realPathFileAlloc(io, file_name, gpa) catch file_name;
+    // realPathFile*Alloc return sentinel slices ([:0]u8 — dupeZ allocates
+    // N+1 bytes). Re-dupe to a plain []u8 and free the sentinel original
+    // with its exact type, so `deinit` can later free every key with the
+    // correct allocation size (a [:0] key freed as []const u8 trips the
+    // DebugAllocator size check).
+    const normalized_path = blk: {
+        if (std.fs.path.isAbsolute(file_name)) {
+            if (std.Io.Dir.realPathFileAbsoluteAlloc(io, file_name, gpa)) |real| {
+                defer gpa.free(real);
+                break :blk try gpa.dupe(u8, real);
+            } else |_| {}
+        } else {
+            if (std.Io.Dir.cwd().realPathFileAlloc(io, file_name, gpa)) |real| {
+                defer gpa.free(real);
+                break :blk try gpa.dupe(u8, real);
+            } else |_| {}
+        }
+        break :blk try gpa.dupe(u8, file_name);
+    };
 
     // Check if this file already exists to avoid duplicate entries
     if (files.getIndex(normalized_path)) |existing_index| {
+        gpa.free(normalized_path);
         return @enumFromInt(existing_index);
     }
 
     const file_index: File.Index = @enumFromInt(files.entries.len);
-    try files.put(gpa, normalized_path, .{ .ast = ast });
+    files.put(gpa, normalized_path, .{ .ast = ast }) catch |err| {
+        gpa.free(normalized_path);
+        return err;
+    };
 
     var w: Walk = .{
         .file = file_index,

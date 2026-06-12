@@ -27,6 +27,7 @@ pub fn main(init: process.Init.Minimal) !void {
     const arena = arena_instance.allocator();
 
     const args = try init.args.toSlice(arena);
+    if (args.len < 6) return error.InvalidArgs;
 
     // skip my own exe name
     var arg_idx: usize = 1;
@@ -113,20 +114,22 @@ pub fn main(init: process.Init.Minimal) !void {
     defer stdout.deinit();
 
     // Collect all modules - from builder.modules and compile steps
-    var all_modules = std.StringHashMap(*std.Build.Module).init(our_allocator);
+    var all_modules: std.StringHashMapUnmanaged(*std.Build.Module) = .empty;
+    defer all_modules.deinit(our_allocator);
 
     // Add global modules
     var global_iter = builder.modules.iterator();
     while (global_iter.next()) |entry| {
-        try all_modules.put(entry.key_ptr.*, entry.value_ptr.*);
+        try all_modules.put(our_allocator, entry.key_ptr.*, entry.value_ptr.*);
     }
 
     // Walk compile steps to find their root modules and imports
-    var visited_steps = std.AutoHashMap(*std.Build.Step, void).init(our_allocator);
+    var visited_steps: std.AutoHashMapUnmanaged(*std.Build.Step, void) = .empty;
+    defer visited_steps.deinit(our_allocator);
     var step_iter = builder.top_level_steps.iterator();
     while (step_iter.next()) |entry| {
         const tls = entry.value_ptr.*;
-        try collectStepModules(&all_modules, &tls.step, &visited_steps);
+        try collectStepModules(our_allocator, &all_modules, &tls.step, &visited_steps);
     }
 
     // Output in JSON format
@@ -193,13 +196,14 @@ pub fn main(init: process.Init.Minimal) !void {
 }
 
 fn collectStepModules(
-    modules: *std.StringHashMap(*std.Build.Module),
+    allocator: std.mem.Allocator,
+    modules: *std.StringHashMapUnmanaged(*std.Build.Module),
     step: *std.Build.Step,
-    visited: *std.AutoHashMap(*std.Build.Step, void),
+    visited: *std.AutoHashMapUnmanaged(*std.Build.Step, void),
 ) !void {
     // Avoid infinite recursion on circular dependencies
     if (visited.contains(step)) return;
-    try visited.put(step, {});
+    try visited.put(allocator, step, {});
 
     // Check if this is a compile step
     if (step.cast(std.Build.Step.Compile)) |compile_step| {
@@ -208,12 +212,12 @@ fn collectStepModules(
         while (iter.next()) |entry| {
             const import_name = entry.key_ptr.*;
             const module = entry.value_ptr.*;
-            try modules.put(import_name, module);
+            try modules.put(allocator, import_name, module);
         }
     }
 
     // Recursively check dependencies
     for (step.dependencies.items) |dep_step| {
-        try collectStepModules(modules, dep_step, visited);
+        try collectStepModules(allocator, modules, dep_step, visited);
     }
 }
