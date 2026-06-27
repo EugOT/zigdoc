@@ -4,6 +4,14 @@ A command-line tool to view documentation for Zig standard library symbols.
 
 ## Installation
 
+With mise:
+
+```bash
+mise use -g github:rockorager/zigdoc
+```
+
+From source:
+
 ```bash
 zig build install -Doptimize=ReleaseFast --prefix $HOME/.local
 ```

@@ -23,6 +23,14 @@ pub fn main(init: std.process.Init) !void {
         \\
         \\## Installation
         \\
+        \\With mise:
+        \\
+        \\```bash
+        \\mise use -g github:rockorager/zigdoc
+        \\```
+        \\
+        \\From source:
+        \\
         \\```bash
         \\zig build install -Doptimize=ReleaseFast --prefix $HOME/.local
         \\```
