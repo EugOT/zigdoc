@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    // Generate README.md as part of the default build
+    // Keep README generation explicit so installs only install the binary.
     const readme_run = b.addRunArtifact(exe);
     readme_run.addArg("--help");
     const help_output = readme_run.captureStdOut(.{});
@@ -33,8 +33,11 @@ pub fn build(b: *std.Build) void {
     run_gen.addFileArg(help_output);
     const readme_file = run_gen.addOutputFileArg("README.md");
 
-    const install_readme = b.addInstallFile(readme_file, "../README.md");
-    b.getInstallStep().dependOn(&install_readme.step);
+    const update_readme = b.addUpdateSourceFiles();
+    update_readme.addCopyFileToSource(readme_file, "README.md");
+
+    const readme_step = b.step("readme", "Regenerate README.md");
+    readme_step.dependOn(&update_readme.step);
 
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
