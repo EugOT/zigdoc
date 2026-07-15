@@ -66,9 +66,19 @@ pub fn build(b: *std.Build) void {
     });
     const run_build_readme_tests = b.addRunArtifact(build_readme_tests);
 
+    const symbol_resolution_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_symbol_resolution.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_symbol_resolution_tests = b.addRunArtifact(symbol_resolution_tests);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_build_readme_tests.step);
+    test_step.dependOn(&run_symbol_resolution_tests.step);
 
     const fmt_step = b.step("fmt", "Check code formatting");
     const fmt_check = b.addFmt(.{
