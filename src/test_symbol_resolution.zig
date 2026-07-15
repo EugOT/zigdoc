@@ -67,14 +67,11 @@ fn resolveHierarchical(allocator: std.mem.Allocator, symbol: []const u8) !?*Decl
 }
 
 test "simple public member resolution" {
-    const allocator = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
-    defer {
-        for (Walk.files.values()) |*file| file.ast.deinit(allocator);
-        Walk.files.deinit(allocator);
-        Walk.decls.deinit(allocator);
-        Walk.modules.deinit(allocator);
-    }
+    defer Walk.deinit();
 
     const source = "pub const A = 1;\n";
     const file_idx = try addTestFile(allocator, "mod.zig", source);
@@ -86,14 +83,11 @@ test "simple public member resolution" {
 }
 
 test "nested struct member resolution" {
-    const allocator = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
-    defer {
-        for (Walk.files.values()) |*file| file.ast.deinit(allocator);
-        Walk.files.deinit(allocator);
-        Walk.decls.deinit(allocator);
-        Walk.modules.deinit(allocator);
-    }
+    defer Walk.deinit();
 
     const source =
         \\pub const S = struct {
@@ -110,14 +104,11 @@ test "nested struct member resolution" {
 }
 
 test "alias chain resolution" {
-    const allocator = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
-    defer {
-        for (Walk.files.values()) |*file| file.ast.deinit(allocator);
-        Walk.files.deinit(allocator);
-        Walk.decls.deinit(allocator);
-        Walk.modules.deinit(allocator);
-    }
+    defer Walk.deinit();
 
     const source =
         \\pub const A = struct {
@@ -135,14 +126,11 @@ test "alias chain resolution" {
 }
 
 test "private member not resolved" {
-    const allocator = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
-    defer {
-        for (Walk.files.values()) |*file| file.ast.deinit(allocator);
-        Walk.files.deinit(allocator);
-        Walk.decls.deinit(allocator);
-        Walk.modules.deinit(allocator);
-    }
+    defer Walk.deinit();
 
     const source = "const hidden = 1;\n";
     const file_idx = try addTestFile(allocator, "mod.zig", source);
@@ -153,14 +141,11 @@ test "private member not resolved" {
 }
 
 test "non-existent symbol" {
-    const allocator = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
-    defer {
-        for (Walk.files.values()) |*file| file.ast.deinit(allocator);
-        Walk.files.deinit(allocator);
-        Walk.decls.deinit(allocator);
-        Walk.modules.deinit(allocator);
-    }
+    defer Walk.deinit();
 
     const source = "pub const A = 1;\n";
     const file_idx = try addTestFile(allocator, "mod.zig", source);
@@ -171,14 +156,11 @@ test "non-existent symbol" {
 }
 
 test "categorize struct with fields as container" {
-    const allocator = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
-    defer {
-        for (Walk.files.values()) |*file| file.ast.deinit(allocator);
-        Walk.files.deinit(allocator);
-        Walk.decls.deinit(allocator);
-        Walk.modules.deinit(allocator);
-    }
+    defer Walk.deinit();
 
     const source =
         \\pub const S = struct {
@@ -196,14 +178,11 @@ test "categorize struct with fields as container" {
 }
 
 test "categorize struct with only consts as namespace" {
-    const allocator = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
-    defer {
-        for (Walk.files.values()) |*file| file.ast.deinit(allocator);
-        Walk.files.deinit(allocator);
-        Walk.decls.deinit(allocator);
-        Walk.modules.deinit(allocator);
-    }
+    defer Walk.deinit();
 
     const source =
         \\pub const S = struct {
@@ -221,14 +200,11 @@ test "categorize struct with only consts as namespace" {
 }
 
 test "type function categorization" {
-    const allocator = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
-    defer {
-        for (Walk.files.values()) |*file| file.ast.deinit(allocator);
-        Walk.files.deinit(allocator);
-        Walk.decls.deinit(allocator);
-        Walk.modules.deinit(allocator);
-    }
+    defer Walk.deinit();
 
     const source =
         \\pub fn MyType() type {
@@ -246,14 +222,11 @@ test "type function categorization" {
 }
 
 test "regular function categorization" {
-    const allocator = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
-    defer {
-        for (Walk.files.values()) |*file| file.ast.deinit(allocator);
-        Walk.files.deinit(allocator);
-        Walk.decls.deinit(allocator);
-        Walk.modules.deinit(allocator);
-    }
+    defer Walk.deinit();
 
     const source =
         \\pub fn myFunc() i32 {
@@ -271,14 +244,11 @@ test "regular function categorization" {
 }
 
 test "deep alias chain within limit" {
-    const allocator = testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
     try setupTest(allocator);
-    defer {
-        for (Walk.files.values()) |*file| file.ast.deinit(allocator);
-        Walk.files.deinit(allocator);
-        Walk.decls.deinit(allocator);
-        Walk.modules.deinit(allocator);
-    }
+    defer Walk.deinit();
 
     const source =
         \\pub const A = struct { pub const X = 1; };

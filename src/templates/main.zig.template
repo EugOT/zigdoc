@@ -1,3 +1,8 @@
 //! Application entry point.
 
-pub fn main() void {}
+const std = @import("std");
+
+pub fn main(init: std.process.Init) !u8 {
+    try std.Io.File.stdout().writeStreamingAll(init.io, "hello\n");
+    return 0;
+}
