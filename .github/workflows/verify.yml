@@ -17,7 +17,7 @@ concurrency:
 jobs:
   verify:
     name: Zig 0.16 on Minerva
-    runs-on: [self-hosted, minerva, linux, x64]
+    runs-on: [self-hosted, build-runner]
     # Do not expose the persistent Minerva runner to untrusted fork code.
     if: >-
       github.event_name != 'pull_request' ||
